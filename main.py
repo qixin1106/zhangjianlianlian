@@ -189,12 +189,19 @@ class Move:
     guaranteed_count: int
     longest_run: int
     special: bool = False
+    special_combo: bool = False
+    creates_skill: bool = False
+    cascade_depth: int = 0
+    target_label: int = UNKNOWN
 
     @property
-    def rank(self) -> tuple[int, int, int, int, int, int, int]:
+    def rank(self) -> tuple[int, ...]:
         lowest = max(self.first[0], self.second[0])
         return (
+            int(self.special_combo),
             int(self.special),
+            int(self.creates_skill),
+            self.cascade_depth,
             self.guaranteed_count,
             self.immediate_count,
             self.longest_run,
@@ -261,6 +268,22 @@ def collapse(board: np.ndarray, cleared: set[Cell]) -> np.ndarray:
     return result
 
 
+def choose_skill_spawns(
+    groups: list[MatchGroup],
+    preferred: tuple[Cell, ...] = (),
+) -> set[Cell]:
+    spawns: set[Cell] = set()
+    for group in groups:
+        if group.length < 4:
+            continue
+        preferred_cells = [cell for cell in preferred if cell in group.cells]
+        if preferred_cells:
+            spawns.add(preferred_cells[0])
+        else:
+            spawns.add(sorted(group.cells)[group.length // 2])
+    return spawns
+
+
 def evaluate_move(
     labels: np.ndarray,
     stable: np.ndarray,
@@ -272,13 +295,18 @@ def evaluate_move(
     if not stable[first] or not stable[second]:
         return None
     if labels[first] == SPECIAL or labels[second] == SPECIAL:
+        combo = labels[first] == SPECIAL and labels[second] == SPECIAL
+        target_label = int(labels[second] if labels[first] == SPECIAL else labels[first])
+        clear_count = ROWS * COLS if combo else int(np.sum(labels == target_label))
         return Move(
             first=first,
             second=second,
-            immediate_count=0,
-            guaranteed_count=0,
+            immediate_count=clear_count,
+            guaranteed_count=clear_count,
             longest_run=0,
             special=True,
+            special_combo=combo,
+            target_label=target_label,
         )
     if labels[first] == labels[second]:
         return None
@@ -290,21 +318,33 @@ def evaluate_move(
         return None
     immediate = set().union(*(group.cells for group in new_groups))
     longest = max(group.length for group in new_groups)
+    creates_skill = any(group.length >= 4 for group in new_groups)
     guaranteed = set(immediate)
-    cleared = set(immediate)
+    spawns = choose_skill_spawns(new_groups, (first, second))
+    for spawn in spawns:
+        work[spawn] = SPECIAL
+    cleared = set(immediate) - spawns
+    cascade_depth = 0
     for _ in range(ROWS):
         work = collapse(work, cleared)
         next_groups = find_matches(work)
         if not next_groups:
             break
-        cleared = set().union(*(group.cells for group in next_groups))
-        guaranteed.update(cleared)
+        matched = set().union(*(group.cells for group in next_groups))
+        guaranteed.update(matched)
+        cascade_depth += 1
+        spawns = choose_skill_spawns(next_groups)
+        for spawn in spawns:
+            work[spawn] = SPECIAL
+        cleared = matched - spawns
     return Move(
         first=first,
         second=second,
         immediate_count=len(immediate),
         guaranteed_count=len(guaranteed),
         longest_run=longest,
+        creates_skill=creates_skill,
+        cascade_depth=cascade_depth,
     )
 
 
@@ -345,12 +385,23 @@ def format_board(labels: np.ndarray) -> str:
 def format_move(move: Move) -> str:
     first = (move.first[0] + 1, move.first[1] + 1)
     second = (move.second[0] + 1, move.second[1] + 1)
+    if move.special_combo:
+        return f"{first} -> {second}，双鬼脸组合技"
     if move.special:
-        return f"{first} -> {second}，绿色鬼脸优先交换"
-    return (
+        target_name = DISPLAY_NAMES[PIECE_NAMES[move.target_label]]
+        return (
+            f"{first} -> {second}，鬼脸消除全部{target_name}，"
+            f"预计 {move.guaranteed_count} 格"
+        )
+    details = (
         f"{first} -> {second}，立即消除 {move.immediate_count}，"
         f"确定总消除 {move.guaranteed_count}，最长匹配 {move.longest_run}"
     )
+    if move.creates_skill:
+        details += "，生成技能"
+    if move.cascade_depth:
+        details += f"，后续连锁 {move.cascade_depth}"
+    return details
 
 
 def load_classifier(image: np.ndarray, threshold: float) -> TemplateClassifier:
@@ -540,7 +591,6 @@ class SwipeAttempt:
     second_label: int
     started_at: float
     retries: int
-    score_patch: np.ndarray | None = None
 
 
 @dataclass
@@ -548,6 +598,9 @@ class BotMetrics:
     attempts: int = 0
     successes: int = 0
     failures: int = 0
+    skill_moves: int = 0
+    specials: int = 0
+    combos: int = 0
 
 
 @dataclass
@@ -560,7 +613,7 @@ class CandyBot:
     capture_shape: tuple[int, int] | None = field(default=None, init=False)
     stabilizer: CellStabilizer = field(init=False)
     listener: keyboard.Listener | None = field(default=None, init=False)
-    attempt: SwipeAttempt | None = field(default=None, init=False)
+    attempts: list[SwipeAttempt] = field(default_factory=list, init=False)
     metrics: BotMetrics = field(default_factory=BotMetrics, init=False)
     run_started_at: float = field(default_factory=time.perf_counter, init=False)
 
@@ -613,23 +666,17 @@ class CandyBot:
 
     def attempt_outcome(
         self,
+        attempt: SwipeAttempt,
         reading: BoardReading,
-        current_score_patch: np.ndarray | None = None,
+        score_changed: bool = False,
     ) -> str:
-        if self.attempt is None:
-            return "none"
-        attempt = self.attempt
         first, second = attempt.move.first, attempt.move.second
         old = (attempt.first_label, attempt.second_label)
         current = (int(reading.labels[first]), int(reading.labels[second]))
         both_stable = bool(reading.stable[first] and reading.stable[second])
         elapsed_ms = (time.perf_counter() - attempt.started_at) * 1000
-        if attempt.score_patch is not None and current_score_patch is not None:
-            score_delta = float(
-                np.mean(np.abs(current_score_patch - attempt.score_patch))
-            )
-            if score_delta > 0.015:
-                return "success"
+        if score_changed:
+            return "success"
         if attempt.move.special:
             special_cells = [
                 cell for cell, label in zip((first, second), old) if label == SPECIAL
@@ -658,6 +705,10 @@ class CandyBot:
             f"[INFO] 手势 {self.metrics.attempts} 次，确认成功 {self.metrics.successes}，"
             f"失败 {self.metrics.failures}，成功率 {success_rate:.1f}%，"
             f"有效交换 {self.metrics.successes / elapsed:.2f}/秒"
+        )
+        print(
+            f"[INFO] 技能生成 {self.metrics.skill_moves}，鬼脸触发 {self.metrics.specials}，"
+            f"双鬼脸组合 {self.metrics.combos}"
         )
 
     def save_debug(
@@ -708,6 +759,7 @@ class CandyBot:
         last_swipe = 0.0
         unreadable_since: float | None = None
         failed_moves: dict[tuple[Cell, Cell, int, int], tuple[int, float]] = {}
+        previous_score_patch: np.ndarray | None = None
         try:
             while not self.stop:
                 cycle_start = time.perf_counter()
@@ -742,15 +794,20 @@ class CandyBot:
                         time.sleep(self.config.detect_interval_ms / 1000)
                         continue
                 now = time.perf_counter()
-                if self.attempt is not None:
-                    outcome = self.attempt_outcome(
-                        reading, capture_score_patch(frame.image)
-                    )
+                current_score_patch = capture_score_patch(frame.image)
+                score_available = (
+                    previous_score_patch is not None
+                    and float(np.mean(np.abs(current_score_patch - previous_score_patch)))
+                    > 0.015
+                )
+                pending_attempts = []
+                for attempt in self.attempts:
+                    outcome = self.attempt_outcome(attempt, reading, score_available)
                     if outcome == "pending":
-                        self.save_debug(frame, reading, None, capture_ms, recognize_ms)
-                        time.sleep(self.config.detect_interval_ms / 1000)
+                        pending_attempts.append(attempt)
                         continue
-                    attempt = self.attempt
+                    if score_available and outcome == "success":
+                        score_available = False
                     move = attempt.move
                     key = (
                         move.first,
@@ -760,6 +817,9 @@ class CandyBot:
                     )
                     if outcome == "success":
                         self.metrics.successes += 1
+                        self.metrics.skill_moves += int(move.creates_skill)
+                        self.metrics.specials += int(move.special and not move.special_combo)
+                        self.metrics.combos += int(move.special_combo)
                         failed_moves.pop(key, None)
                     else:
                         self.metrics.failures += 1
@@ -771,7 +831,8 @@ class CandyBot:
                             f"[RETRY] {format_move(move)}，第 {count} 次未确认生效，"
                             f"{backoff:.2f}s 后允许重试"
                         )
-                    self.attempt = None
+                self.attempts = pending_attempts
+                previous_score_patch = current_score_patch
                 if reading.stable.sum() < 8:
                     if unreadable_since is None:
                         unreadable_since = now
@@ -780,8 +841,15 @@ class CandyBot:
                         break
                 else:
                     unreadable_since = None
+                pending_cells = {
+                    cell
+                    for attempt in self.attempts
+                    for cell in (attempt.move.first, attempt.move.second)
+                }
                 available_moves = []
                 for move in find_moves(reading.labels, reading.stable):
+                    if move.first in pending_cells or move.second in pending_cells:
+                        continue
                     key = (
                         move.first,
                         move.second,
@@ -814,22 +882,28 @@ class CandyBot:
                     elapsed_ms = (now - last_swipe) * 1000
                     frame_age_ms = (now - cycle_start) * 1000
                     if (
-                        elapsed_ms >= self.config.min_swipe_interval_ms
+                        len(self.attempts) < 3
+                        and elapsed_ms >= self.config.min_swipe_interval_ms
                         and frame_age_ms <= self.config.max_frame_age_ms
                     ):
-                        tag = "SPECIAL" if best.special else "MOVE"
+                        tag = (
+                            "COMBO" if best.special_combo
+                            else "SPECIAL" if best.special
+                            else "MOVE"
+                        )
                         suffix = f"，第 {retries + 1} 次尝试" if retries else ""
                         print(f"[{tag}] {format_move(best)}{suffix}")
                         self.metrics.attempts += 1
                         self.swipe(frame, best)
                         started_at = time.perf_counter()
-                        self.attempt = SwipeAttempt(
-                            move=best,
-                            first_label=int(reading.labels[best.first]),
-                            second_label=int(reading.labels[best.second]),
-                            started_at=started_at,
-                            retries=retries,
-                            score_patch=capture_score_patch(frame.image),
+                        self.attempts.append(
+                            SwipeAttempt(
+                                move=best,
+                                first_label=int(reading.labels[best.first]),
+                                second_label=int(reading.labels[best.second]),
+                                started_at=started_at,
+                                retries=retries,
+                            )
                         )
                         last_swipe = started_at
                         time.sleep(self.config.post_swipe_delay_ms / 1000)
