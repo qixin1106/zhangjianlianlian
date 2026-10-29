@@ -1,0 +1,14 @@
+[project]
+name = "zhangjianfuzhu"
+version = "0.1.0"
+description = "杖剑传说糖果消消夜辅助脚本"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "numpy>=2.0",
+    "opencv-python>=5.0.0.93",
+    "pillow>=12.3.0",
+    "pyautogui>=0.9.54",
+    "pynput>=1.8.2",
+    "pyobjc-framework-Quartz>=12.0",
+]
