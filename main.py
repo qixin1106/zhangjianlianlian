@@ -85,6 +85,7 @@ class BoardReading:
     labels: np.ndarray
     confidence: np.ndarray
     margins: np.ndarray
+    offsets: np.ndarray
     stable: np.ndarray
 
 
@@ -116,41 +117,56 @@ class TemplateClassifier:
                 cv2.resize(template, (size, size), interpolation=cv2.INTER_AREA)
             )
 
-    def classify_cell(self, cell: np.ndarray) -> tuple[int, float, float]:
+    def classify_cell(
+        self, cell: np.ndarray
+    ) -> tuple[int, float, float, tuple[float, float]]:
         cell = cv2.resize(
             cell,
             (self.cell_size, self.cell_size),
             interpolation=cv2.INTER_AREA,
         )
         scores: list[float] = []
+        locations: list[tuple[int, int]] = []
         for template in self.templates:
             result = cv2.matchTemplate(cell, template, cv2.TM_CCOEFF_NORMED)
-            _, best, _, _ = cv2.minMaxLoc(result)
+            _, best, _, location = cv2.minMaxLoc(result)
             scores.append(float(best))
+            locations.append(location)
         order = np.argsort(scores)[::-1]
         best_index = int(order[0])
         best_score = scores[best_index]
         margin = best_score - scores[int(order[1])]
+        template = self.templates[best_index]
+        expected_x = (self.cell_size - template.shape[1]) / 2
+        expected_y = (self.cell_size - template.shape[0]) / 2
+        location = locations[best_index]
+        offset = (location[0] - expected_x, location[1] - expected_y)
         if best_score < self.threshold or margin < self.min_margin:
-            return UNKNOWN, best_score, margin
-        return best_index, best_score, margin
+            return UNKNOWN, best_score, margin, offset
+        return best_index, best_score, margin, offset
 
     def recognize(self, image: np.ndarray) -> BoardReading:
         geometry = BoardGeometry.from_image(image)
         labels = np.full((ROWS, COLS), UNKNOWN, dtype=np.int8)
         confidence = np.zeros((ROWS, COLS), dtype=np.float32)
         margins = np.zeros((ROWS, COLS), dtype=np.float32)
+        offsets = np.zeros((ROWS, COLS, 2), dtype=np.float32)
         for row in range(ROWS):
             for col in range(COLS):
-                label, score, margin = self.classify_cell(geometry.crop(image, row, col))
+                label, score, margin, offset = self.classify_cell(
+                    geometry.crop(image, row, col)
+                )
                 labels[row, col] = label
                 confidence[row, col] = score
                 margins[row, col] = margin
+                offsets[row, col] = offset
+        centered = np.max(np.abs(offsets), axis=2) <= 2
         return BoardReading(
             labels=labels,
             confidence=confidence,
             margins=margins,
-            stable=labels >= 0,
+            offsets=offsets,
+            stable=(labels >= 0) & centered,
         )
 
 
@@ -420,6 +436,16 @@ def capture_game_window() -> WindowFrame:
     )
 
 
+def capture_score_patch(image: np.ndarray) -> np.ndarray:
+    geometry = BoardGeometry.from_image(image)
+    x1, y1 = round(40 * geometry.scale_x), round(250 * geometry.scale_y)
+    x2, y2 = round(220 * geometry.scale_x), round(320 * geometry.scale_y)
+    patch = image[y1:y2, x1:x2]
+    gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
+    resized = cv2.resize(gray, (90, 35), interpolation=cv2.INTER_AREA)
+    return resized.astype(np.float32) / 255.0
+
+
 STATE_REGIONS = {
     "start": (390, 1430, 480, 210),
     "success": (330, 300, 600, 230),
@@ -458,23 +484,36 @@ class CellStabilizer:
     def __init__(self, required_frames: int) -> None:
         self.required_frames = max(1, required_frames)
         self.previous = np.full((ROWS, COLS), UNKNOWN, dtype=np.int8)
+        self.previous_offsets = np.zeros((ROWS, COLS, 2), dtype=np.float32)
         self.counts = np.zeros((ROWS, COLS), dtype=np.int16)
 
     def reset(self) -> None:
         self.previous.fill(UNKNOWN)
+        self.previous_offsets.fill(0)
         self.counts.fill(0)
 
     def update(self, reading: BoardReading) -> BoardReading:
         current = reading.labels
         known = current >= 0
-        same = known & (current == self.previous)
-        self.counts = np.where(same, self.counts + 1, np.where(known, 1, 0))
+        centered = np.max(np.abs(reading.offsets), axis=2) <= 2
+        position_delta = np.max(
+            np.abs(reading.offsets - self.previous_offsets), axis=2
+        )
+        same = (
+            known
+            & centered
+            & (current == self.previous)
+            & (position_delta <= 1.25)
+        )
+        self.counts = np.where(same, self.counts + 1, np.where(known & centered, 1, 0))
         self.previous = current.copy()
-        stable = known & (self.counts >= self.required_frames)
+        self.previous_offsets = reading.offsets.copy()
+        stable = known & centered & (self.counts >= self.required_frames)
         return BoardReading(
             labels=current,
             confidence=reading.confidence,
             margins=reading.margins,
+            offsets=reading.offsets,
             stable=stable,
         )
 
@@ -483,12 +522,32 @@ class CellStabilizer:
 class BotConfig:
     detect_interval_ms: int = 100
     cell_stable_frames: int = 2
-    swipe_duration_ms: int = 120
+    swipe_hold_ms: int = 80
+    swipe_duration_ms: int = 180
     post_swipe_delay_ms: int = 120
     min_swipe_interval_ms: int = 300
+    attempt_timeout_ms: int = 500
+    max_frame_age_ms: int = 180
     threshold: float = 0.72
     dry_run: bool = False
     debug: bool = False
+
+
+@dataclass
+class SwipeAttempt:
+    move: Move
+    first_label: int
+    second_label: int
+    started_at: float
+    retries: int
+    score_patch: np.ndarray | None = None
+
+
+@dataclass
+class BotMetrics:
+    attempts: int = 0
+    successes: int = 0
+    failures: int = 0
 
 
 @dataclass
@@ -501,6 +560,9 @@ class CandyBot:
     capture_shape: tuple[int, int] | None = field(default=None, init=False)
     stabilizer: CellStabilizer = field(init=False)
     listener: keyboard.Listener | None = field(default=None, init=False)
+    attempt: SwipeAttempt | None = field(default=None, init=False)
+    metrics: BotMetrics = field(default_factory=BotMetrics, init=False)
+    run_started_at: float = field(default_factory=time.perf_counter, init=False)
 
     def __post_init__(self) -> None:
         self.stabilizer = CellStabilizer(self.config.cell_stable_frames)
@@ -538,7 +600,7 @@ class CandyBot:
         pyautogui.moveTo(x=x1, y=y1)
         pyautogui.mouseDown(button="left")
         try:
-            time.sleep(0.05)
+            time.sleep(self.config.swipe_hold_ms / 1000)
             pyautogui.dragTo(
                 x=x2,
                 y=y2,
@@ -548,6 +610,55 @@ class CandyBot:
             )
         finally:
             pyautogui.mouseUp(button="left")
+
+    def attempt_outcome(
+        self,
+        reading: BoardReading,
+        current_score_patch: np.ndarray | None = None,
+    ) -> str:
+        if self.attempt is None:
+            return "none"
+        attempt = self.attempt
+        first, second = attempt.move.first, attempt.move.second
+        old = (attempt.first_label, attempt.second_label)
+        current = (int(reading.labels[first]), int(reading.labels[second]))
+        both_stable = bool(reading.stable[first] and reading.stable[second])
+        elapsed_ms = (time.perf_counter() - attempt.started_at) * 1000
+        if attempt.score_patch is not None and current_score_patch is not None:
+            score_delta = float(
+                np.mean(np.abs(current_score_patch - attempt.score_patch))
+            )
+            if score_delta > 0.015:
+                return "success"
+        if attempt.move.special:
+            special_cells = [
+                cell for cell, label in zip((first, second), old) if label == SPECIAL
+            ]
+            if special_cells and all(
+                reading.stable[cell] and reading.labels[cell] != SPECIAL
+                for cell in special_cells
+            ):
+                return "success"
+        elif both_stable:
+            if current == (old[1], old[0]):
+                return "success"
+            if current[0] != old[0] and current[1] != old[1]:
+                return "success"
+        if elapsed_ms >= self.config.attempt_timeout_ms:
+            if both_stable and current == old:
+                return "failure"
+            if elapsed_ms >= max(1200, self.config.attempt_timeout_ms * 2):
+                return "failure"
+        return "pending"
+
+    def print_metrics(self) -> None:
+        elapsed = max(0.001, time.perf_counter() - self.run_started_at)
+        success_rate = self.metrics.successes / max(1, self.metrics.attempts) * 100
+        print(
+            f"[INFO] 手势 {self.metrics.attempts} 次，确认成功 {self.metrics.successes}，"
+            f"失败 {self.metrics.failures}，成功率 {success_rate:.1f}%，"
+            f"有效交换 {self.metrics.successes / elapsed:.2f}/秒"
+        )
 
     def save_debug(
         self,
@@ -596,8 +707,7 @@ class CandyBot:
         print("[INFO] 等待开始页面或有效棋盘，请保持游戏窗口可见")
         last_swipe = 0.0
         unreadable_since: float | None = None
-        previous_labels: np.ndarray | None = None
-        blocked_moves: set[tuple[Cell, Cell]] = set()
+        failed_moves: dict[tuple[Cell, Cell, int, int], tuple[int, float]] = {}
         try:
             while not self.stop:
                 cycle_start = time.perf_counter()
@@ -626,30 +736,42 @@ class CandyBot:
                 if not self.started:
                     if reading.stable.sum() == ROWS * COLS:
                         self.started = True
+                        self.run_started_at = time.perf_counter()
                         print("[INFO] 棋盘已稳定，开始寻找交换")
                     else:
                         time.sleep(self.config.detect_interval_ms / 1000)
                         continue
-                if previous_labels is None or not np.array_equal(
-                    reading.labels, previous_labels
-                ):
-                    blocked_moves.clear()
-                previous_labels = reading.labels.copy()
-                moves = [
-                    move
-                    for move in find_moves(reading.labels, reading.stable)
-                    if (move.first, move.second) not in blocked_moves
-                ]
-                best = moves[0] if moves else None
-                self.save_debug(frame, reading, best, capture_ms, recognize_ms)
-                if self.config.dry_run:
-                    visible = np.where(reading.stable, reading.labels, UNKNOWN)
-                    print(format_board(visible))
-                    print(f"\n稳定 {reading.stable.sum()}/{ROWS * COLS} 格，合法交换 {len(moves)} 个")
-                    if best is not None:
-                        print(f"建议 {format_move(best)}")
-                    break
                 now = time.perf_counter()
+                if self.attempt is not None:
+                    outcome = self.attempt_outcome(
+                        reading, capture_score_patch(frame.image)
+                    )
+                    if outcome == "pending":
+                        self.save_debug(frame, reading, None, capture_ms, recognize_ms)
+                        time.sleep(self.config.detect_interval_ms / 1000)
+                        continue
+                    attempt = self.attempt
+                    move = attempt.move
+                    key = (
+                        move.first,
+                        move.second,
+                        attempt.first_label,
+                        attempt.second_label,
+                    )
+                    if outcome == "success":
+                        self.metrics.successes += 1
+                        failed_moves.pop(key, None)
+                    else:
+                        self.metrics.failures += 1
+                        previous_failures = failed_moves.get(key, (0, 0))[0]
+                        count = previous_failures + 1
+                        backoff = min(1.5, 0.25 * 2 ** (count - 1))
+                        failed_moves[key] = (count, now + backoff)
+                        print(
+                            f"[RETRY] {format_move(move)}，第 {count} 次未确认生效，"
+                            f"{backoff:.2f}s 后允许重试"
+                        )
+                    self.attempt = None
                 if reading.stable.sum() < 8:
                     if unreadable_since is None:
                         unreadable_since = now
@@ -658,14 +780,58 @@ class CandyBot:
                         break
                 else:
                     unreadable_since = None
+                available_moves = []
+                for move in find_moves(reading.labels, reading.stable):
+                    key = (
+                        move.first,
+                        move.second,
+                        int(reading.labels[move.first]),
+                        int(reading.labels[move.second]),
+                    )
+                    _, retry_at = failed_moves.get(key, (0, 0))
+                    if now >= retry_at:
+                        available_moves.append(move)
+                best = available_moves[0] if available_moves else None
+                self.save_debug(frame, reading, best, capture_ms, recognize_ms)
+                if self.config.dry_run:
+                    visible = np.where(reading.stable, reading.labels, UNKNOWN)
+                    print(format_board(visible))
+                    print(
+                        f"\n稳定 {reading.stable.sum()}/{ROWS * COLS} 格，"
+                        f"合法交换 {len(available_moves)} 个"
+                    )
+                    if best is not None:
+                        print(f"建议 {format_move(best)}")
+                    break
                 if best is not None:
+                    key = (
+                        best.first,
+                        best.second,
+                        int(reading.labels[best.first]),
+                        int(reading.labels[best.second]),
+                    )
+                    retries = failed_moves.get(key, (0, 0))[0]
                     elapsed_ms = (now - last_swipe) * 1000
-                    if elapsed_ms >= self.config.min_swipe_interval_ms:
+                    frame_age_ms = (now - cycle_start) * 1000
+                    if (
+                        elapsed_ms >= self.config.min_swipe_interval_ms
+                        and frame_age_ms <= self.config.max_frame_age_ms
+                    ):
                         tag = "SPECIAL" if best.special else "MOVE"
-                        print(f"[{tag}] {format_move(best)}")
+                        suffix = f"，第 {retries + 1} 次尝试" if retries else ""
+                        print(f"[{tag}] {format_move(best)}{suffix}")
+                        self.metrics.attempts += 1
                         self.swipe(frame, best)
-                        blocked_moves.add((best.first, best.second))
-                        last_swipe = time.perf_counter()
+                        started_at = time.perf_counter()
+                        self.attempt = SwipeAttempt(
+                            move=best,
+                            first_label=int(reading.labels[best.first]),
+                            second_label=int(reading.labels[best.second]),
+                            started_at=started_at,
+                            retries=retries,
+                            score_patch=capture_score_patch(frame.image),
+                        )
+                        last_swipe = started_at
                         time.sleep(self.config.post_swipe_delay_ms / 1000)
                 elapsed = time.perf_counter() - cycle_start
                 remaining = self.config.detect_interval_ms / 1000 - elapsed
@@ -678,6 +844,8 @@ class CandyBot:
         finally:
             if self.listener is not None:
                 self.listener.stop()
+            if self.metrics.attempts:
+                self.print_metrics()
             print("[INFO] 已退出")
 
 
@@ -710,9 +878,12 @@ def main() -> None:
     parser.add_argument("--threshold", type=float, default=0.72)
     parser.add_argument("--detect-interval-ms", type=int, default=100)
     parser.add_argument("--cell-stable-frames", type=int, default=2)
-    parser.add_argument("--swipe-duration-ms", type=int, default=120)
+    parser.add_argument("--swipe-hold-ms", type=int, default=80)
+    parser.add_argument("--swipe-duration-ms", type=int, default=180)
     parser.add_argument("--post-swipe-delay-ms", type=int, default=120)
     parser.add_argument("--min-swipe-interval-ms", type=int, default=300)
+    parser.add_argument("--attempt-timeout-ms", type=int, default=500)
+    parser.add_argument("--max-frame-age-ms", type=int, default=180)
     parser.add_argument("--dry-run", action="store_true", help="只识别并建议，不操作鼠标")
     parser.add_argument("--debug", action="store_true", help="保存诊断截图并输出耗时")
     args = parser.parse_args()
@@ -722,9 +893,12 @@ def main() -> None:
     config = BotConfig(
         detect_interval_ms=args.detect_interval_ms,
         cell_stable_frames=args.cell_stable_frames,
+        swipe_hold_ms=args.swipe_hold_ms,
         swipe_duration_ms=args.swipe_duration_ms,
         post_swipe_delay_ms=args.post_swipe_delay_ms,
         min_swipe_interval_ms=args.min_swipe_interval_ms,
+        attempt_timeout_ms=args.attempt_timeout_ms,
+        max_frame_age_ms=args.max_frame_age_ms,
         threshold=args.threshold,
         dry_run=args.dry_run,
         debug=args.debug,
