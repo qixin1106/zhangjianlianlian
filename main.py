@@ -15,19 +15,21 @@ from pynput import keyboard
 ROWS = 9
 COLS = 7
 UNKNOWN = -1
+SPECIAL = 5
 REFERENCE_WIDTH = 1262
 REFERENCE_HEIGHT = 1880
 REFERENCE_XS = np.array([242, 371, 500, 630, 759, 888, 1017], dtype=np.float64)
 REFERENCE_YS = np.array(
     [505, 634, 764, 893, 1022, 1152, 1281, 1410, 1540], dtype=np.float64
 )
-PIECE_NAMES = ("pumpkin", "tree", "castle", "bat", "ghost")
+PIECE_NAMES = ("pumpkin", "tree", "castle", "bat", "ghost", "special")
 DISPLAY_NAMES = {
     "pumpkin": "南瓜",
     "tree": "树桩",
     "castle": "城堡",
     "bat": "蝙蝠",
     "ghost": "幽灵",
+    "special": "鬼脸",
     "unknown": "未知",
 }
 ROOT = Path(__file__).resolve().parent
@@ -87,6 +89,9 @@ class BoardReading:
 
 
 class TemplateClassifier:
+    cell_size = 36
+    source_cell_size = 144
+
     def __init__(
         self,
         template_dir: Path,
@@ -96,18 +101,27 @@ class TemplateClassifier:
     ) -> None:
         self.threshold = threshold
         self.min_margin = min_margin
-        size = geometry.template_size
         self.templates: list[np.ndarray] = []
         for name in PIECE_NAMES:
             path = template_dir / f"{name}.png"
             template = cv2.imread(str(path), cv2.IMREAD_COLOR)
             if template is None:
                 raise FileNotFoundError(f"缺少棋子模板: {path}")
+            crop_size = 64 if name == "special" else 80
+            x = (template.shape[1] - crop_size) // 2
+            y = (template.shape[0] - crop_size) // 2
+            template = template[y : y + crop_size, x : x + crop_size]
+            size = max(8, round(crop_size * self.cell_size / self.source_cell_size))
             self.templates.append(
                 cv2.resize(template, (size, size), interpolation=cv2.INTER_AREA)
             )
 
     def classify_cell(self, cell: np.ndarray) -> tuple[int, float, float]:
+        cell = cv2.resize(
+            cell,
+            (self.cell_size, self.cell_size),
+            interpolation=cv2.INTER_AREA,
+        )
         scores: list[float] = []
         for template in self.templates:
             result = cv2.matchTemplate(cell, template, cv2.TM_CCOEFF_NORMED)
@@ -123,8 +137,6 @@ class TemplateClassifier:
 
     def recognize(self, image: np.ndarray) -> BoardReading:
         geometry = BoardGeometry.from_image(image)
-        if geometry.template_size != self.templates[0].shape[0]:
-            raise ValueError("分类器模板尺寸与图像不匹配")
         labels = np.full((ROWS, COLS), UNKNOWN, dtype=np.int8)
         confidence = np.zeros((ROWS, COLS), dtype=np.float32)
         margins = np.zeros((ROWS, COLS), dtype=np.float32)
@@ -160,11 +172,13 @@ class Move:
     immediate_count: int
     guaranteed_count: int
     longest_run: int
+    special: bool = False
 
     @property
-    def rank(self) -> tuple[int, int, int, int, int, int]:
+    def rank(self) -> tuple[int, int, int, int, int, int, int]:
         lowest = max(self.first[0], self.second[0])
         return (
+            int(self.special),
             self.guaranteed_count,
             self.immediate_count,
             self.longest_run,
@@ -181,9 +195,13 @@ def find_matches(board: np.ndarray) -> list[MatchGroup]:
         while start < COLS:
             label = int(board[row, start])
             end = start + 1
-            while end < COLS and label >= 0 and int(board[row, end]) == label:
+            while (
+                end < COLS
+                and 0 <= label != SPECIAL
+                and int(board[row, end]) == label
+            ):
                 end += 1
-            if label >= 0 and end - start >= 3:
+            if 0 <= label != SPECIAL and end - start >= 3:
                 groups.append(
                     MatchGroup(
                         label=label,
@@ -197,9 +215,13 @@ def find_matches(board: np.ndarray) -> list[MatchGroup]:
         while start < ROWS:
             label = int(board[start, col])
             end = start + 1
-            while end < ROWS and label >= 0 and int(board[end, col]) == label:
+            while (
+                end < ROWS
+                and 0 <= label != SPECIAL
+                and int(board[end, col]) == label
+            ):
                 end += 1
-            if label >= 0 and end - start >= 3:
+            if 0 <= label != SPECIAL and end - start >= 3:
                 groups.append(
                     MatchGroup(
                         label=label,
@@ -231,7 +253,18 @@ def evaluate_move(
 ) -> Move | None:
     if labels[first] < 0 or labels[second] < 0:
         return None
-    if not stable[first] or not stable[second] or labels[first] == labels[second]:
+    if not stable[first] or not stable[second]:
+        return None
+    if labels[first] == SPECIAL or labels[second] == SPECIAL:
+        return Move(
+            first=first,
+            second=second,
+            immediate_count=0,
+            guaranteed_count=0,
+            longest_run=0,
+            special=True,
+        )
+    if labels[first] == labels[second]:
         return None
     work = np.where(stable, labels, UNKNOWN).astype(np.int8)
     work[first], work[second] = work[second], work[first]
@@ -291,6 +324,17 @@ def format_board(labels: np.ndarray) -> str:
             )
         )
     return "\n".join(lines)
+
+
+def format_move(move: Move) -> str:
+    first = (move.first[0] + 1, move.first[1] + 1)
+    second = (move.second[0] + 1, move.second[1] + 1)
+    if move.special:
+        return f"{first} -> {second}，绿色鬼脸优先交换"
+    return (
+        f"{first} -> {second}，立即消除 {move.immediate_count}，"
+        f"确定总消除 {move.guaranteed_count}，最长匹配 {move.longest_run}"
+    )
 
 
 def load_classifier(image: np.ndarray, threshold: float) -> TemplateClassifier:
@@ -454,6 +498,7 @@ class CandyBot:
     started: bool = False
     start_attempted: bool = False
     classifier: TemplateClassifier | None = field(default=None, init=False)
+    capture_shape: tuple[int, int] | None = field(default=None, init=False)
     stabilizer: CellStabilizer = field(init=False)
     listener: keyboard.Listener | None = field(default=None, init=False)
 
@@ -467,12 +512,11 @@ class CandyBot:
         return None
 
     def ensure_classifier(self, image: np.ndarray) -> TemplateClassifier:
-        geometry = BoardGeometry.from_image(image)
-        if (
-            self.classifier is None
-            or self.classifier.templates[0].shape[0] != geometry.template_size
-        ):
+        if self.classifier is None:
             self.classifier = load_classifier(image, self.config.threshold)
+        shape = image.shape[:2]
+        if self.capture_shape != shape:
+            self.capture_shape = shape
             self.stabilizer.reset()
         return self.classifier
 
@@ -517,7 +561,26 @@ class CandyBot:
             return
         debug_dir = ROOT / "debug"
         debug_dir.mkdir(exist_ok=True)
-        cv2.imwrite(str(debug_dir / "current.png"), frame.image)
+        output = frame.image.copy()
+        geometry = BoardGeometry.from_image(output)
+        radius = max(8, round(56 * geometry.scale_x))
+        for row in range(ROWS):
+            for col in range(COLS):
+                if reading.stable[row, col]:
+                    continue
+                x, y = geometry.center(row, col)
+                cv2.rectangle(
+                    output,
+                    (x - radius, y - radius),
+                    (x + radius, y + radius),
+                    (0, 0, 255),
+                    2,
+                )
+        if move is not None:
+            first = geometry.center(*move.first)
+            second = geometry.center(*move.second)
+            cv2.arrowedLine(output, first, second, (0, 255, 0), 4, tipLength=0.25)
+        cv2.imwrite(str(debug_dir / "current.png"), output)
         print(
             f"[DEBUG] 截图 {capture_ms:.1f}ms，识别 {recognize_ms:.1f}ms，"
             f"稳定 {reading.stable.sum()}/{ROWS * COLS}，候选 {move}"
@@ -584,12 +647,7 @@ class CandyBot:
                     print(format_board(visible))
                     print(f"\n稳定 {reading.stable.sum()}/{ROWS * COLS} 格，合法交换 {len(moves)} 个")
                     if best is not None:
-                        a = (best.first[0] + 1, best.first[1] + 1)
-                        b = (best.second[0] + 1, best.second[1] + 1)
-                        print(
-                            f"建议 {a} -> {b}，立即消除 {best.immediate_count}，"
-                            f"确定总消除 {best.guaranteed_count}"
-                        )
+                        print(f"建议 {format_move(best)}")
                     break
                 now = time.perf_counter()
                 if reading.stable.sum() < 8:
@@ -603,12 +661,8 @@ class CandyBot:
                 if best is not None:
                     elapsed_ms = (now - last_swipe) * 1000
                     if elapsed_ms >= self.config.min_swipe_interval_ms:
-                        a = (best.first[0] + 1, best.first[1] + 1)
-                        b = (best.second[0] + 1, best.second[1] + 1)
-                        print(
-                            f"[MOVE] {a} -> {b}，立即 {best.immediate_count}，"
-                            f"确定总计 {best.guaranteed_count}"
-                        )
+                        tag = "SPECIAL" if best.special else "MOVE"
+                        print(f"[{tag}] {format_move(best)}")
                         self.swipe(frame, best)
                         blocked_moves.add((best.first, best.second))
                         last_swipe = time.perf_counter()
@@ -647,12 +701,7 @@ def run_offline(image_path: Path, threshold: float) -> None:
         return
     print(f"共 {len(moves)} 个合法交换，前 5 个：")
     for move in moves[:5]:
-        a = (move.first[0] + 1, move.first[1] + 1)
-        b = (move.second[0] + 1, move.second[1] + 1)
-        print(
-            f"{a} -> {b}，立即消除 {move.immediate_count}，"
-            f"确定总消除 {move.guaranteed_count}，最长匹配 {move.longest_run}"
-        )
+        print(format_move(move))
 
 
 def main() -> None:
