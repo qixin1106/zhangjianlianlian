@@ -613,6 +613,7 @@ class CandyBot:
     listener: keyboard.Listener | None = field(default=None, init=False)
     attempts: list[SwipeAttempt] = field(default_factory=list, init=False)
     metrics: BotMetrics = field(default_factory=BotMetrics, init=False)
+    failure_reasons: dict[str, int] = field(default_factory=dict, init=False)
     run_started_at: float = field(default_factory=time.perf_counter, init=False)
 
     def __post_init__(self) -> None:
@@ -692,9 +693,9 @@ class CandyBot:
                 return "success"
         if elapsed_ms >= self.config.attempt_timeout_ms:
             if both_stable and current == old:
-                return "failure"
-            if elapsed_ms >= max(1200, self.config.attempt_timeout_ms * 2):
-                return "failure"
+                return "failure:stable"
+            if elapsed_ms >= max(2500, self.config.attempt_timeout_ms * 2):
+                return "failure:timeout"
         return "pending"
 
     def print_metrics(self) -> None:
@@ -709,6 +710,11 @@ class CandyBot:
             f"[INFO] 技能生成 {self.metrics.skill_moves}，鬼脸触发 {self.metrics.specials}，"
             f"双鬼脸组合 {self.metrics.combos}"
         )
+        if self.failure_reasons:
+            reasons = "，".join(
+                f"{reason} {count}" for reason, count in self.failure_reasons.items()
+            )
+            print(f"[INFO] 失败原因：{reasons}")
 
     def save_debug(
         self,
@@ -809,13 +815,15 @@ class CandyBot:
                         failed_moves.pop(key, None)
                     else:
                         self.metrics.failures += 1
+                        reason = outcome.split(":", 1)[1]
+                        self.failure_reasons[reason] = self.failure_reasons.get(reason, 0) + 1
                         previous_failures = failed_moves.get(key, (0, 0))[0]
                         count = previous_failures + 1
-                        backoff = min(1.5, 0.25 * 2 ** (count - 1))
+                        backoff = min(1.5, 0.25 * 2 ** (count - 1)) if count < 3 else 5.0
                         failed_moves[key] = (count, now + backoff)
                         print(
-                            f"[RETRY] {format_move(move)}，第 {count} 次未确认生效，"
-                            f"{backoff:.2f}s 后允许重试"
+                            f"[RETRY] {format_move(move)}，第 {count} 次未确认生效"
+                            f"（{reason}），{backoff:.2f}s 后允许重试"
                         )
                 self.attempts = pending_attempts
                 previous_score_patch = current_score_patch
