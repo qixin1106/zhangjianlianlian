@@ -498,7 +498,6 @@ def capture_score_patch(image: np.ndarray) -> np.ndarray:
 
 
 STATE_REGIONS = {
-    "start": (390, 1430, 480, 210),
     "success": (330, 300, 600, 230),
 }
 STATE_TEMPLATE_CACHE: dict[str, np.ndarray] = {}
@@ -608,7 +607,6 @@ class CandyBot:
     config: BotConfig
     stop: bool = False
     started: bool = False
-    start_attempted: bool = False
     classifier: TemplateClassifier | None = field(default=None, init=False)
     capture_shape: tuple[int, int] | None = field(default=None, init=False)
     stabilizer: CellStabilizer = field(init=False)
@@ -635,34 +633,35 @@ class CandyBot:
             self.stabilizer.reset()
         return self.classifier
 
-    def click_start(self, frame: WindowFrame) -> None:
-        geometry = BoardGeometry.from_image(frame.image)
-        x, y = frame.screen_point(
-            630 * geometry.scale_x,
-            1530 * geometry.scale_y,
-        )
-        pyautogui.click(x=x, y=y, button="left")
-        print("[INFO] 已点击开始游戏，等待倒计时结束")
-
     def swipe(self, frame: WindowFrame, move: Move) -> None:
         geometry = BoardGeometry.from_image(frame.image)
         first_x, first_y = geometry.center(*move.first)
         second_x, second_y = geometry.center(*move.second)
         x1, y1 = frame.screen_point(first_x, first_y)
         x2, y2 = frame.screen_point(second_x, second_y)
-        pyautogui.moveTo(x=x1, y=y1)
-        pyautogui.mouseDown(button="left")
+        down = Quartz.kCGEventLeftMouseDown
+        drag = Quartz.kCGEventLeftMouseDragged
+        up = Quartz.kCGEventLeftMouseUp
+        moved = Quartz.kCGEventMouseMoved
+
+        def post(event_type: int, x: float, y: float) -> None:
+            event = Quartz.CGEventCreateMouseEvent(
+                None, event_type, (x, y), Quartz.kCGMouseButtonLeft
+            )
+            Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
+
+        post(moved, x1, y1)
+        post(down, x1, y1)
         try:
             time.sleep(self.config.swipe_hold_ms / 1000)
-            pyautogui.dragTo(
-                x=x2,
-                y=y2,
-                duration=self.config.swipe_duration_ms / 1000,
-                button="left",
-                mouseDownUp=False,
-            )
+            steps = 6
+            for i in range(1, steps + 1):
+                t = i / steps
+                post(drag, x1 + (x2 - x1) * t, y1 + (y2 - y1) * t)
+                if i < steps:
+                    time.sleep(self.config.swipe_duration_ms / 1000 / steps)
         finally:
-            pyautogui.mouseUp(button="left")
+            post(up, x2, y2)
 
     def attempt_outcome(
         self,
@@ -755,7 +754,7 @@ class CandyBot:
         self.listener.daemon = True
         self.listener.start()
         print("[INFO] 辅助脚本已启动，按 ESC 停止")
-        print("[INFO] 等待开始页面或有效棋盘，请保持游戏窗口可见")
+        print("[INFO] 等待有效棋盘，请保持游戏窗口可见")
         last_swipe = 0.0
         unreadable_since: float | None = None
         failed_moves: dict[tuple[Cell, Cell, int, int], tuple[int, float]] = {}
