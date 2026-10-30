@@ -768,19 +768,6 @@ class CandyBot:
                 if state_score(frame.image, "success") >= 0.76:
                     print("[INFO] 检测到挑战成功，脚本停止")
                     break
-                if (
-                    not self.started
-                    and not self.start_attempted
-                    and state_score(frame.image, "start") >= 0.68
-                ):
-                    if self.config.dry_run:
-                        print("[INFO] 当前是开始页面，dry-run 不点击开始按钮")
-                        break
-                    self.start_attempted = True
-                    self.click_start(frame)
-                    time.sleep(3.25)
-                    self.stabilizer.reset()
-                    continue
                 recognize_start = time.perf_counter()
                 classifier = self.ensure_classifier(frame.image)
                 reading = self.stabilizer.update(classifier.recognize(frame.image))
